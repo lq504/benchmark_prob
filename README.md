@@ -1,4 +1,6 @@
-# benchmark_prob demo
+# benchmark_prob
+
+Code for the benchmark problem.
 
 This folder contains a self-contained notebook demo and sample data files.
 
