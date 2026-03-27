@@ -36,6 +36,22 @@ jupyter notebook
 
 Then open `benchmark_prob_demo.ipynb` and run all cells.
 
+## Get updates (`git pull`)
+
+If you already cloned this repo, update to the latest `main`:
+
+```bash
+git checkout main
+git pull origin main
+```
+
+If you want the demo branch instead:
+
+```bash
+git checkout benchmark-prob-demo
+git pull origin benchmark-prob-demo
+```
+
 ## Notes
 
 - Run Jupyter from this directory so relative paths resolve to the local sample `.txt` files.
