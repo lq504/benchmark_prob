@@ -4,6 +4,15 @@ Code for the benchmark problem.
 
 This folder contains a self-contained notebook demo and sample data files.
 
+## Download
+
+Clone the repository and enter the project folder:
+
+```bash
+git clone https://github.com/lq504/benchmark_prob.git
+cd benchmark_prob
+```
+
 ## Contents
 
 - `benchmark_prob_demo.ipynb`
@@ -43,13 +52,6 @@ If you already cloned this repo, update to the latest `main`:
 ```bash
 git checkout main
 git pull origin main
-```
-
-If you want the demo branch instead:
-
-```bash
-git checkout benchmark-prob-demo
-git pull origin benchmark-prob-demo
 ```
 
 ## Notes
