@@ -344,13 +344,14 @@ class Instanton:
         z_hat: float = 1.0,
         det_tol: float = 1e-8,
         eig_floor: float = 1e-10,
+        sigma_prior: Optional[float] = 2,
         n_eigs: Optional[int] = None,
         projectMPerp: bool = True,
     ) -> Dict[str, float]:
         m = jnp.asarray(result.log_theta, dtype=self.posterior.solver.dtype)
         dim = int(m.size)
-        C0_sqrt = jnp.eye(dim, dtype=m.dtype)
-        C0_inv_sqrt = jnp.eye(dim, dtype=m.dtype)
+        C0_sqrt = sigma_prior*jnp.eye(dim, dtype=m.dtype)
+        #C0_inv_sqrt = 1/sigma_prior*jnp.eye(dim, dtype=m.dtype)
 
         dJ = self.grad_rate(m)
         lmda_kkt = jnp.asarray(result.lam, dtype=m.dtype)
@@ -367,29 +368,30 @@ class Instanton:
             return jax.jvp(self.grad_qoi, (m,), (v,))[1]
 
         @jax.jit
-        def A_matvec(v: Array) -> Array:
+        def L_matvec(v: Array) -> Array:
             vin = _project_perp_unit(ebar, v) if projectMPerp else v
             y = C0_sqrt @ vin
             Hy = hessvec_J(y) - lmda_kkt * hessvec_q(y)
             inner = vin - (C0_sqrt @ Hy)
             ldt = _project_perp_unit(ebar, inner) if projectMPerp else inner
-            return v - ldt
+            return ldt
 
         def matvec_np(x_np: np.ndarray) -> np.ndarray:
-            y = A_matvec(jnp.asarray(x_np, dtype=m.dtype))
+            y = L_matvec(jnp.asarray(x_np, dtype=m.dtype))
             return np.asarray(jax.device_get(y), dtype=np.float64)
 
         op = LinearOperator((dim, dim), matvec=matvec_np, dtype=np.float64)
         k = int((dim - 1) if n_eigs is None else min(max(1, n_eigs), dim - 1))
         evals = eigsh(op, k=k, which="LM", tol=det_tol, return_eigenvectors=False)
         evals = np.real(evals)
-        logdet = float(np.sum(np.log(np.clip(np.abs(evals), eig_floor, None))))
+        logdet = float(np.sum(np.log(np.clip(np.abs(1.0 - evals), eig_floor, None))))
 
         base_factor = (1.0 / z_hat) * jnp.sqrt(eps / (2.0 * jnp.pi)) * jnp.exp(-J_inst / eps)
-        dJ_norm = jnp.linalg.norm(dJ) + 1e-14
-        term1 = jnp.vdot(dJ, C0_inv_sqrt @ dJ) / (dJ_norm**3)
+        #dJ_norm = jnp.linalg.norm(dJ) + 1e-14
+        #term1 = jnp.vdot(dJ, C0_inv_sqrt @ dJ) / (dJ_norm**3)
+        term1 = jnp.linalg.norm(C0_sqrt @ dJ)
         det_term = jnp.exp(-0.5 * logdet)
-        exceedance_prob = (2.0 * jnp.pi * eps) ** (dim / 2.0) * base_factor * term1 * det_term
+        exceedance_prob = (2.0 * jnp.pi * eps* sigma_prior**2) ** (dim / 2.0) * base_factor / term1 * det_term
         density_estimate = jnp.abs(lmda_kkt / eps) * exceedance_prob
 
         return {
@@ -400,6 +402,7 @@ class Instanton:
             "exceedance_prob": float(jax.device_get(exceedance_prob)),
             "density_estimate": float(jax.device_get(density_estimate)),
             "det_k": int(k),
+            "evals": evals.tolist(),
         }
 
 
@@ -527,15 +530,14 @@ if qoi_samples.size == 0:
 
 q95 = float(np.percentile(qoi_samples, 95.0))
 upper = float(np.max(qoi_samples))
-if upper <= q95:
-    upper = q95 + 0.25
-z_grid = np.linspace(q95, upper, 6)
+lower = float(np.min(qoi_samples))
+z_grid = np.linspace(lower, upper, 8)
 
 print("\nQoI histogram range for density overlay")
 print("  qoi_idx       =", qoi_idx)
-print("  q95           =", q95)
+print("  lower           =", lower)
 print("  upper         =", upper)
-print("  n_grid        =", len(z_grid))
+print("  z_grid        =", len(z_grid))
 print("  n_samples     =", qoi_samples.size)
 
 # 6) Overlay a few instanton-based density estimates on histogram
@@ -559,7 +561,7 @@ for z_val in z_grid:
         res_z,
         eps=eps_for_Zhat,
         z_hat=float(Z_hat_laplace),
-        n_eigs=20,
+        n_eigs=None,
     )
     density_grid.append(est_z["density_estimate"])
     exceedance_grid.append(est_z["exceedance_prob"])
@@ -586,3 +588,70 @@ plt.show()
 print("\nPointwise estimates on z-grid")
 for z_val, ex_val, den_val, lam_val in zip(z_grid, exceedance_grid, density_grid, lambda_grid):
     print(f"  z={z_val:.6f} | exceedance={ex_val:.3e} | density={den_val:.3e} | lambda={lam_val:.6f}")
+
+# %%
+# --- Plot eigenvalues and logdet ---
+# CHOOSE Z VALUE HERE
+z_choice = -3.0  # Change this to any value in z_grid or any float in the data range
+
+# Compute instanton and eigenvalues for chosen z
+res_z_choice = instanton.searchInstantonViaAugmented(
+    targetObservable=float(z_choice),
+    muMin=np.log10(1.0),
+    muMax=np.log10(1_000.0),
+    nMu=4,
+    initLbda=float(inst_res.lam),
+    initialM=np.asarray(jax.device_get(log_theta_map), dtype=np.float64),
+)
+
+est_z_final = instanton.exceedance_probability_estimate(
+    res_z_choice,
+    eps=eps_for_Zhat,
+    z_hat=float(Z_hat_laplace),
+    n_eigs=None,
+)
+evals = np.array(est_z_final.get('evals', []))
+
+if len(evals) > 0:
+    # Main plot: sorted eigenvalues
+    fig, ax = plt.subplots(figsize=(5, 5))
+    sorted_evals = np.sort(evals)
+    sorted_evals = evals[::-1]  # Sort in descending order for better visualization
+    ax.loglog(range(1, len(sorted_evals) + 1), np.abs(sorted_evals), 'x', 
+              linewidth=1.5, markersize=7, color='darkred', label=r'$|\lambda_i|$')
+    
+    # Reference line for i^-1
+    idx_ref = np.arange(1, len(sorted_evals) + 1)
+    ax.loglog(idx_ref, 1.0 / idx_ref**2, 'k--', linewidth=1.5, alpha=0.6, label=r'$\propto i^{-2}$')
+    
+    ax.set_xlabel('Index $i$', fontsize=12, fontweight='bold')
+    ax.set_ylabel(r'$|\lambda_i|$', fontsize=12, fontweight='bold')
+    ax.set_title(f'Eigenvalues of $p_m A_x p_m$ for $z={z_choice:.2f}$', fontsize=13, fontweight='bold')
+    ax.legend(fontsize=11, loc='lower left')
+    #ax.grid(False, alpha=0.3, which='both')
+    
+    # Inset plot: cumulative product of (1 - lambda_i) - TOP RIGHT CORNER
+    ax_inset = ax.inset_axes([0.6, 0.65, 0.35, 0.3])
+    cum_prod = np.cumprod(np.abs(1.0 - sorted_evals))
+    ax_inset.semilogy(range(1, len(cum_prod) + 1), cum_prod, 'o', 
+                       linewidth=1, markersize=2, color='darkred')
+    ax_inset.set_xlabel('$m$', fontsize=10)
+    #ax_inset.set_ylabel(r'$\prod_{i=1}^m (1-\lambda_i)$', fontsize=10)
+    ax_inset.grid(False, alpha=0.3, which='both')
+    
+    # Print logdet info
+    logdet = est_z_final.get('logdet', None)
+    if logdet is not None:
+        print(f"\nLogdet = {logdet:.6f}")
+        print(f"Number of eigenvalues: {len(evals)}")
+        print(f"Min eigenvalue: {np.min(evals):.6f}")
+        print(f"Max eigenvalue: {np.max(evals):.6f}")
+        print(f"Mean eigenvalue: {np.mean(evals):.6f}")
+        final_prod = np.prod(np.abs(1.0 - evals))
+        print(f"Final product ∏(1-λᵢ) = {final_prod:.6e}")
+else:
+    print("No eigenvalues available to plot")
+
+plt.tight_layout()
+plt.show()
+

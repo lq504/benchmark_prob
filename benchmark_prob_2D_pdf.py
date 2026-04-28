@@ -231,9 +231,9 @@ class PosteriorModel:
 @dataclass
 class InstantonResult:
     log_theta: Array
-    qoi: float
+    qoi: Array
     rate: float
-    lam: float
+    lam: Array
     mu: float
     success: bool
     message: str
@@ -252,32 +252,58 @@ def _project_perp_unit(e: Array, x: Array) -> Array:
 class Instanton:
     posterior: PosteriorModel
     qoi_fn: Callable[[Array], Array]
+    qoi_dim: int = 1  # Dimension of QoI (1 for scalar, 2 for 2D, etc.)
 
     def __post_init__(self):
         self.rate_fn = jax.jit(lambda x: -self.posterior.log_posterior(x))
         self.grad_rate = jax.jit(jax.grad(self.rate_fn))
-        self.grad_qoi = jax.jit(jax.grad(self.qoi_fn))
+        
+        # For multi-dimensional QoI
+        if self.qoi_dim == 1:
+            self.grad_qoi = jax.jit(jax.grad(self.qoi_fn))
+        else:
+            self.grad_qoi = jax.jit(jax.jacobian(self.qoi_fn))
+        
         self.rate_and_grad = jax.jit(jax.value_and_grad(self.rate_fn))
-        self.qoi_and_grad = jax.jit(jax.value_and_grad(self.qoi_fn))
+        
+        if self.qoi_dim == 1:
+            self.qoi_and_grad = jax.jit(jax.value_and_grad(self.qoi_fn))
+        else:
+            def qoi_and_jac(x):
+                return self.qoi_fn(x), self.grad_qoi(x)
+            self.qoi_and_grad = jax.jit(qoi_and_jac)
 
     def optimize(
         self,
-        lbda: float,
-        targetObservable: float = 1.0,
+        lbda: Array,
+        targetObservable: Array,
         mu: float = 0.0,
         initialM: Optional[np.ndarray] = None,
         maxiter: int = 200,
         method: str = "L-BFGS-B",
-    ) -> Tuple[float, float, float, Array]:
+    ) -> Tuple[Array, float, Array, Array]:
         m0 = np.asarray(initialM, dtype=np.float64) if initialM is not None else np.zeros((self.posterior.solver.theta_dim,), dtype=np.float64)
+        
+        lbda = jnp.asarray(lbda, dtype=self.posterior.solver.dtype)
+        targetObservable = jnp.asarray(targetObservable, dtype=self.posterior.solver.dtype)
 
         def objective(m_np: np.ndarray):
             m = jnp.asarray(m_np, dtype=self.posterior.solver.dtype)
             rate, grad_rate = self.rate_and_grad(m)
             q, grad_q = self.qoi_and_grad(m)
+            
+            # Constraint: c = q - targetObservable
             c = q - targetObservable
-            val = rate - lbda * c + 0.5 * mu * c * c
-            grad = grad_rate + (-lbda + mu * c) * grad_q
+            
+            # Objective: J - lambda^T * c + 0.5 * mu * ||c||^2
+            val = rate - jnp.dot(lbda, c) + 0.5 * mu * jnp.dot(c, c)
+            
+            # Gradient
+            if self.qoi_dim == 1:
+                grad = grad_rate - lbda * grad_q + mu * c * grad_q
+            else:
+                grad = grad_rate - grad_q.T @ lbda + mu * grad_q.T @ c
+            
             return float(jax.device_get(val)), np.asarray(jax.device_get(grad), dtype=np.float64)
 
         def fun(x: np.ndarray) -> float:
@@ -290,22 +316,29 @@ class Instanton:
 
         res = minimize(fun=fun, x0=m0, jac=jac, method=method, options={"maxiter": maxiter})
         m = jnp.asarray(res.x, dtype=self.posterior.solver.dtype)
-        obsValue = float(jax.device_get(self.qoi_fn(m)))
+        obsValue = jnp.asarray(self.qoi_fn(m), dtype=self.posterior.solver.dtype)
         action = float(jax.device_get(self.rate_fn(m)))
-        return obsValue, action, float(lbda), m
+        return obsValue, action, lbda, m
 
     def searchInstantonViaAugmented(
         self,
-        targetObservable: float,
+        targetObservable: Array,
         muMin: float = np.log10(5.0),
         muMax: float = np.log10(100.0),
         nMu: int = 8,
-        initLbda: float = 1.0,
+        initLbda: Optional[Array] = None,
         initialM: Optional[np.ndarray] = None,
+        maxiter_optimize: int = 200,
         tol_constraint: float = 1e-6,
     ) -> InstantonResult:
         muList = np.logspace(muMin, muMax, nMu)
-        lbda = float(initLbda)
+        targetObservable = jnp.asarray(targetObservable, dtype=self.posterior.solver.dtype)
+        
+        if initLbda is None:
+            lbda = jnp.zeros((self.qoi_dim,), dtype=self.posterior.solver.dtype)
+        else:
+            lbda = jnp.asarray(initLbda, dtype=self.posterior.solver.dtype)
+        
         m = initialM
         history: List[Dict[str, float]] = []
 
@@ -315,24 +348,38 @@ class Instanton:
                 targetObservable=targetObservable,
                 mu=float(mu),
                 initialM=m,
+                maxiter=maxiter_optimize,
             )
             c = targetObservable - obsValue
-            lbda = float(mu) * c + lbda
+            lbda = mu * c + lbda
             m = np.asarray(jax.device_get(m_j), dtype=np.float64)
-            history.append({"mu": float(mu), "lambda": float(lbda), "qoi": float(obsValue), "rate": float(action), "constraint": float(c)})
+            
+            qoi_val = jax.device_get(obsValue)
+            c_val = jax.device_get(c)
+            constraint_norm = float(jnp.linalg.norm(c))
+            
+            history.append({
+                "mu": float(mu),
+                "lambda_norm": float(jnp.linalg.norm(lbda)),
+                "qoi_norm": float(jnp.linalg.norm(jnp.asarray(qoi_val))),
+                "rate": float(action),
+                "constraint_norm": float(constraint_norm)
+            })
 
         m_final = jnp.asarray(m, dtype=self.posterior.solver.dtype)
-        q_final = float(jax.device_get(self.qoi_fn(m_final)))
+        q_final = jnp.asarray(self.qoi_fn(m_final), dtype=self.posterior.solver.dtype)
         rate_final = float(jax.device_get(self.rate_fn(m_final)))
-        msg = "constraint met" if abs(q_final - targetObservable) <= tol_constraint else "constraint tolerance not met"
+        c_final = q_final - targetObservable
+        constraint_norm_final = float(jnp.linalg.norm(c_final))
+        msg = "constraint met" if constraint_norm_final <= tol_constraint else "constraint tolerance not met"
 
         return InstantonResult(
             log_theta=m_final,
             qoi=q_final,
             rate=rate_final,
-            lam=float(lbda),
+            lam=lbda,
             mu=float(muList[-1]),
-            success=bool(abs(q_final - targetObservable) <= max(tol_constraint, 1e-4)),
+            success=bool(constraint_norm_final <= max(tol_constraint, 1e-4)),
             message=msg,
             history=history,
         )
@@ -344,58 +391,97 @@ class Instanton:
         z_hat: float = 1.0,
         det_tol: float = 1e-8,
         eig_floor: float = 1e-10,
+        sigma_prior: Optional[float] = 2,
         n_eigs: Optional[int] = None,
         projectMPerp: bool = True,
-    ) -> Dict[str, float]:
+    ) -> Dict[str, object]:
         m = jnp.asarray(result.log_theta, dtype=self.posterior.solver.dtype)
         dim = int(m.size)
-        C0_sqrt = jnp.eye(dim, dtype=m.dtype)
-        C0_inv_sqrt = jnp.eye(dim, dtype=m.dtype)
+        C0_sqrt = sigma_prior * jnp.eye(dim, dtype=m.dtype)
 
-        dJ = self.grad_rate(m)
-        lmda_kkt = jnp.asarray(result.lam, dtype=m.dtype)
+        dq_raw = self.grad_qoi(m)
+        dq = dq_raw[None, :] if self.qoi_dim == 1 else dq_raw
+        lmda_kkt = jnp.atleast_1d(jnp.asarray(result.lam, dtype=m.dtype))
         J_inst = self.rate_fn(m)
 
-        ebar = _normalize(C0_sqrt @ dJ)
+        # 1. Define the Preconditioned Gradient and Gramian (Eq 2.19)
+        # B has one column per QoI constraint in the preconditioned metric
+        B = (C0_sqrt @ dq.T)
+        G = dq @ (C0_sqrt @ (C0_sqrt @ dq.T))
+        G = 0.5 * (G + G.T)
+        G = G + eig_floor * jnp.eye(G.shape[0], dtype=G.dtype)
+        G_det = jnp.linalg.det(G)
+
+        def project_tangent(v: Array) -> Array:
+            coeff = jnp.linalg.solve(G, B.T @ v)
+            return v - B @ coeff
 
         @jax.jit
         def hessvec_J(v: Array) -> Array:
             return jax.jvp(self.grad_rate, (m,), (v,))[1]
 
         @jax.jit
-        def hessvec_q(v: Array) -> Array:
-            return jax.jvp(self.grad_qoi, (m,), (v,))[1]
+        def hessvec_q_weighted(v: Array) -> Array:
+            if self.qoi_dim == 1:
+                return lmda_kkt[0] * jax.jvp(self.grad_qoi, (m,), (v,))[1]
+            hq = jax.jvp(self.grad_qoi, (m,), (v,))[1]
+            return jnp.tensordot(lmda_kkt, hq, axes=1)
 
+        # 2. Operator Evaluation (Eq 2.20 & 2.21)
+        # This remains structurally identical. It naturally evaluates the 
+        # non-trivial eigenvalues of (I_n - Pi_par @ A @ Pi_par)
         @jax.jit
-        def A_matvec(v: Array) -> Array:
-            vin = _project_perp_unit(ebar, v) if projectMPerp else v
+        def L_matvec(v: Array) -> Array:
+            vin = project_tangent(v) if projectMPerp else v
             y = C0_sqrt @ vin
-            Hy = hessvec_J(y) - lmda_kkt * hessvec_q(y)
+            Hy = hessvec_J(y) - hessvec_q_weighted(y)
             inner = vin - (C0_sqrt @ Hy)
-            ldt = _project_perp_unit(ebar, inner) if projectMPerp else inner
-            return v - ldt
+            ldt = project_tangent(inner) if projectMPerp else inner
+            return ldt
 
         def matvec_np(x_np: np.ndarray) -> np.ndarray:
-            y = A_matvec(jnp.asarray(x_np, dtype=m.dtype))
+            y = L_matvec(jnp.asarray(x_np, dtype=m.dtype))
             return np.asarray(jax.device_get(y), dtype=np.float64)
 
         op = LinearOperator((dim, dim), matvec=matvec_np, dtype=np.float64)
         k = int((dim - 1) if n_eigs is None else min(max(1, n_eigs), dim - 1))
         evals = eigsh(op, k=k, which="LM", tol=det_tol, return_eigenvectors=False)
         evals = np.real(evals)
-        logdet = float(np.sum(np.log(np.clip(np.abs(evals), eig_floor, None))))
+        
+        # Calculate eigenvalues of the Hessian, dropping the abs() as discussed!
+        hessian_evals = 1.0 - evals
+        if np.any(hessian_evals < -1e-5):
+            import warnings
+            warnings.warn("Negative eigenvalue detected. The instanton point is a saddle.")
+            
+        logdet = float(np.sum(np.log(np.clip(hessian_evals, eig_floor, None))))
 
-        base_factor = (1.0 / z_hat) * jnp.sqrt(eps / (2.0 * jnp.pi)) * jnp.exp(-J_inst / eps)
-        dJ_norm = jnp.linalg.norm(dJ) + 1e-14
-        term1 = jnp.vdot(dJ, C0_inv_sqrt @ dJ) / (dJ_norm**3)
-        det_term = jnp.exp(-0.5 * logdet)
-        exceedance_prob = (2.0 * jnp.pi * eps) ** (dim / 2.0) * base_factor * term1 * det_term
-        density_estimate = jnp.abs(lmda_kkt / eps) * exceedance_prob
+        # 3. Evaluate the Density Estimate directly from Eq 2.18
+        # We maintain your prior volume normalization for dimensional correctness
+        prior_vol = (2.0 * jnp.pi * eps * sigma_prior**2) ** (dim / 2.0)
+        codim = int(dq.shape[0])
+        
+        density_estimate = (
+            (1.0 / z_hat) * prior_vol *
+            (2.0 * jnp.pi * eps) ** (-0.5 * codim) *
+            (G_det) ** (-0.5) * # det(G)^{-1/2}
+            jnp.exp(-0.5 * logdet) * # det(I - Pi A Pi)^{-1/2}
+            jnp.exp(-J_inst / eps)
+        )
 
+        # 4. Recover Exceedance Probability from the density
+        # Using the standard tail approximation: P(q >= z) \approx p(z) * (\epsilon / |\lambda|)
+        if lmda_kkt.size == 1:
+            exceedance_prob = density_estimate * (eps / jnp.abs(lmda_kkt[0]))
+        else:
+            exceedance_prob = jnp.nan
+
+        qoi_val = jax.device_get(self.qoi_fn(m))
+        lam_val = jax.device_get(lmda_kkt)
         return {
-            "qoi": float(jax.device_get(self.qoi_fn(m))),
+            "qoi": float(qoi_val) if np.ndim(qoi_val) == 0 else np.asarray(qoi_val, dtype=np.float64).tolist(),
             "rate": float(jax.device_get(J_inst)),
-            "lambda": float(jax.device_get(lmda_kkt)),
+            "lambda": float(lam_val) if np.ndim(lam_val) == 0 else np.asarray(lam_val, dtype=np.float64).tolist(),
             "logdet": float(logdet),
             "exceedance_prob": float(jax.device_get(exceedance_prob)),
             "density_estimate": float(jax.device_get(density_estimate)),
@@ -404,185 +490,135 @@ class Instanton:
 
 
 def qoi_block(log_theta: Array, ix: int = 0, iy: int = 1, n_blocks: int = 8) -> Array:
+    """1D QoI: extract single block value"""
     blocks = jnp.reshape(log_theta, (n_blocks, n_blocks)).T
     return blocks[ix, iy]
 
 
+def qoi_block_2d(log_theta: Array, ix_list, iy_list, n_blocks: int = 8) -> Array:
+    """2D QoI: extract multiple block values as a vector"""
+    blocks = jnp.reshape(log_theta, (n_blocks, n_blocks)).T
+    return jnp.array([blocks[ix, iy] for ix, iy in zip(ix_list, iy_list)])
+
+
 # %%
-# --- demo ---
-import matplotlib.pyplot as plt
-from pathlib import Path
+# 6) Overlay 2D instanton-based density estimates on empirical 2D histogram
+from matplotlib.colors import LogNorm
 
-# 1) Build solver
-solver = PDESolver(n_cells=32, n_blocks=8)
+print("\nEvaluating 2D Instanton Density Grid...")
 
-# 2) Posterior + MAP
-posterior = PosteriorModel(solver=solver, z_hat=None, sigma_like=0.05, sigma_prior=2.0)
-x0 = np.zeros((solver.theta_dim,), dtype=np.float64)
-map_out = posterior.map_estimate(x0=x0)
-log_theta_map = map_out["log_theta_map"]
+# Speed/accuracy presets: set FAST_MODE=False for higher-quality results
+FAST_MODE = True
+if FAST_MODE:
+    grid_res = 6
+    n_mu_steps = 3
+    n_eigs_density = 8
+    maxiter_opt = 60
+else:
+    grid_res = 12
+    n_mu_steps = 4
+    n_eigs_density = 20
+    maxiter_opt = 200
 
-print("MAP success:", map_out["success"])
-print("MAP message:", map_out["message"])
-print("MAP log posterior:", float(jax.device_get(map_out["log_post_map"])))
+# Recreate instance so method updates in class definitions are picked up
+instanton = Instanton(
+    posterior=posterior,
+    qoi_fn=instanton.qoi_fn,
+    qoi_dim=2,
+ )
 
-# 3) Instanton object + baseline instanton
-ix, iy = 1, 1
-q_fn = lambda lt: qoi_block(lt, ix=ix, iy=iy, n_blocks=solver.n_blocks)
-instanton = Instanton(posterior=posterior, qoi_fn=q_fn)
+# Extract the two 1D sample arrays
+qoi1_samples = qoi_samples_2d[0]
+qoi2_samples = qoi_samples_2d[1]
 
-q_map = float(jax.device_get(q_fn(log_theta_map)))
-z_target = q_map + 0.2
+# Define bounds for the 2D grid based on sample data
+z1_min, z1_max = float(np.min(qoi1_samples)), float(np.max(qoi1_samples))
+z2_min, z2_max = float(np.min(qoi2_samples)), float(np.max(qoi2_samples))
 
-inst_res = instanton.searchInstantonViaAugmented(
-    targetObservable=float(z_target),
-    muMin=np.log10(1.0),
-    muMax=np.log10(1_000.0),
-    nMu=4,
-    initLbda=0.0,
-    initialM=np.asarray(jax.device_get(log_theta_map)),
-)
+# A 2D grid requires grid_res * grid_res solver evaluations.
+z1_grid = np.linspace(z1_min, z1_max, grid_res)
+z2_grid = np.linspace(z2_min, z2_max, grid_res)
 
-print("\nInstanton success:", inst_res.success)
-print("Instanton qoi:", inst_res.qoi)
-print("Instanton rate:", inst_res.rate)
-print("Instanton lambda:", inst_res.lam)
+# Create a 2D meshgrid (using 'ij' indexing so Z1[i, j] matches z1_grid[i], z2_grid[j])
+Z1, Z2 = np.meshgrid(z1_grid, z2_grid, indexing='ij')
+density_grid_2d = np.zeros_like(Z1)
 
-# 4) Laplace approximation at MAP: evidence and derived Z_hat
-log_posterior_log_theta = lambda x: posterior.log_posterior(x)
-
-x_map = jnp.asarray(log_theta_map)
-d = int(x_map.size)
-eps_for_Zhat = 1.0
-
-logf_map = log_posterior_log_theta(x_map)
-
-def J(x):
-    return -log_posterior_log_theta(x)
-
-gradJ = jax.grad(J)
-
-@jax.jit
-def hvp(v):
-    return jax.jvp(gradJ, (x_map,), (v,))[1]
-
-cols = []
-eye_dtype = x_map.dtype
-for i in range(d):
-    e = jnp.zeros((d,), dtype=eye_dtype).at[i].set(1.0)
-    col = hvp(e)
-    cols.append(np.asarray(jax.device_get(col), dtype=float))
-H_np = np.column_stack(cols)
-H_np = 0.5 * (H_np + H_np.T)
-
-sign, logdetH = np.linalg.slogdet(H_np)
-jitter_used = 0.0
-if (not np.isfinite(logdetH)) or (sign <= 0):
-    for jit in [1e-10, 1e-8, 1e-6, 1e-4, 1e-2]:
-        sign, logdetH = np.linalg.slogdet(H_np + jit * np.eye(d))
-        if np.isfinite(logdetH) and (sign > 0):
-            jitter_used = float(jit)
-            break
-
-if sign <= 0 or (not np.isfinite(logdetH)):
-    print("WARNING: Hessian not SPD / slogdet invalid; Laplace evidence may be invalid.")
-    print("  sign=", sign, "logdetH=", logdetH, "jitter_used=", jitter_used)
-
-logZhat_laplace = float(jax.device_get(logf_map)) + 0.5 * d * np.log(2.0 * np.pi) - 0.5 * float(logdetH)
-Z_hat_laplace = float(np.exp(logZhat_laplace))
-
-print("\nLaplace evidence at MAP (JVP/HVP-based)")
-print("  d             =", d)
-print("  logf(MAP)     =", float(jax.device_get(logf_map)))
-print("  slogdet(H): sign=", float(sign), "logdet=", float(logdetH))
-print("  jitter_used   =", float(jitter_used))
-print("  logZhat_laplace =", float(logZhat_laplace))
-
-print("\nDerived Z_hat (Laplace)")
-print("  eps_for_Zhat      =", float(eps_for_Zhat))
-print("  logZhat_laplace   =", float(logZhat_laplace))
-print("  Z_hat_laplace     =", float(Z_hat_laplace))
-
-# 5) Sample histogram at QoI index (in log-theta coordinates)
-qoi_idx = iy * solver.n_blocks + ix
-data_dir = Path(".")
-sample_files = sorted(data_dir.glob("samples-*.txt"))
-
-qoi_samples = []
-for path in sample_files:
-    with path.open("r") as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) < 66:
-                continue
-            theta = np.array([float(v) for v in parts[2:]], dtype=np.float64)
-            if np.any(theta <= 0.0):
-                continue
-            log_theta = np.log(theta)
-            qoi_samples.append(log_theta[qoi_idx])
-
-qoi_samples = np.asarray(qoi_samples, dtype=np.float64)
-if qoi_samples.size == 0:
-    raise RuntimeError("No valid samples parsed for QoI histogram.")
-
-q95 = float(np.percentile(qoi_samples, 95.0))
-upper = float(np.max(qoi_samples))
-if upper <= q95:
-    upper = q95 + 0.25
-z_grid = np.linspace(q95, upper, 6)
-
-print("\nQoI histogram range for density overlay")
-print("  qoi_idx       =", qoi_idx)
-print("  q95           =", q95)
-print("  upper         =", upper)
-print("  n_grid        =", len(z_grid))
-print("  n_samples     =", qoi_samples.size)
-
-# 6) Overlay a few instanton-based density estimates on histogram
-density_grid = []
-exceedance_grid = []
-lambda_grid = []
-
+# Initialize warm-start variables with the MAP estimate
 m_init = np.asarray(jax.device_get(log_theta_map), dtype=np.float64)
-lam_init = float(inst_res.lam)
+lam_init = jnp.zeros(2, dtype=np.float64)
 
-for z_val in z_grid:
-    res_z = instanton.searchInstantonViaAugmented(
-        targetObservable=float(z_val),
-        muMin=np.log10(1.0),
-        muMax=np.log10(1_000.0),
-        nMu=4,
-        initLbda=float(lam_init),
-        initialM=m_init,
-    )
-    est_z = instanton.exceedance_probability_estimate(
-        res_z,
-        eps=eps_for_Zhat,
-        z_hat=float(Z_hat_laplace),
-        n_eigs=20,
-    )
-    density_grid.append(est_z["density_estimate"])
-    exceedance_grid.append(est_z["exceedance_prob"])
-    lambda_grid.append(est_z["lambda"])
-    m_init = np.asarray(jax.device_get(res_z.log_theta), dtype=np.float64)
-    lam_init = float(res_z.lam)
+# Evaluate the Instanton solver over the 2D mesh
+total = grid_res * grid_res
+counter = 0
+for i in range(grid_res):
+    for j in range(grid_res):
+        z_target_iter = jnp.array([Z1[i, j], Z2[i, j]], dtype=np.float64)
 
-density_grid = np.asarray(density_grid, dtype=np.float64)
-exceedance_grid = np.asarray(exceedance_grid, dtype=np.float64)
-lambda_grid = np.asarray(lambda_grid, dtype=np.float64)
+        res_z = instanton.searchInstantonViaAugmented(
+            targetObservable=z_target_iter,
+            muMin=np.log10(1.0),
+            muMax=np.log10(1_000.0),
+            nMu=n_mu_steps,
+            initLbda=lam_init,
+            initialM=m_init,
+            maxiter_optimize=maxiter_opt,
+        )
 
-plt.figure(figsize=(8, 4.5))
-plt.hist(qoi_samples, bins=50, density=True, alpha=0.35, label=f"Sample histogram: log_theta[{qoi_idx}]")
-plt.plot(z_grid, density_grid, "o-", lw=2, ms=5, label="Instanton density estimate")
-plt.axvline(q95, color="k", ls="--", lw=1.5, label="95th percentile")
-plt.xlabel(f"QoI = log_theta[{qoi_idx}] (ix={ix}, iy={iy})")
-plt.ylabel("Density")
-plt.yscale("log")
-plt.title("Tail density overlay: sample histogram vs instanton estimates")
-plt.legend()
+        # Calculate density estimate; lower n_eigs in FAST_MODE to reduce runtime
+        est_z = instanton.exceedance_probability_estimate(
+            res_z,
+            eps=eps_for_Zhat,
+            z_hat=float(Z_hat_laplace),
+            n_eigs=n_eigs_density,
+        )
+        density_grid_2d[i, j] = est_z["density_estimate"]
+
+        # Warm start the next grid point using the current solution to speed up convergence
+        if res_z.success:
+            m_init = np.asarray(jax.device_get(res_z.log_theta), dtype=np.float64)
+            lam_init = jax.device_get(res_z.lam)
+
+        counter += 1
+        if counter % max(1, total // 8) == 0 or counter == total:
+            print(f"Progress: {counter}/{total}")
+
+# --- Plotting the 2D Overlay ---
+fig, ax = plt.subplots(figsize=(8, 6))
+
+# 1. Plot the Empirical 2D Histogram (Log Scale)
+h = ax.hist2d(
+    qoi1_samples,
+    qoi2_samples,
+    bins=40,
+    density=True,
+    norm=LogNorm(),
+    cmap='Blues',
+    alpha=0.8
+)
+fig.colorbar(h[3], ax=ax, label='Empirical Density')
+
+# 2. Plot the Theoretical Instanton Contours
+# Filter out invalid values to prevent log warnings when creating contour levels
+valid_densities = density_grid_2d[np.isfinite(density_grid_2d) & (density_grid_2d > 0)]
+if valid_densities.size > 1:
+    min_den = valid_densities.min()
+    max_den = valid_densities.max()
+    if max_den > min_den:
+        levels = np.logspace(np.log10(min_den), np.log10(max_den), 8)
+        cs = ax.contour(
+            Z1,
+            Z2,
+            density_grid_2d,
+            levels=levels,
+            colors='red',
+            linewidths=1.5,
+            norm=LogNorm(),
+        )
+        ax.clabel(cs, inline=True, fmt='%.1e', fontsize=9, colors='red')
+
+ax.set_xlabel(f"QoI 0 = log_theta[{qoi_idx_list[0]}]")
+ax.set_ylabel(f"QoI 1 = log_theta[{qoi_idx_list[1]}]")
+ax.set_title("2D QoI Density: Sample Histogram vs Instanton Approximation")
+
 plt.tight_layout()
 plt.show()
-
-print("\nPointwise estimates on z-grid")
-for z_val, ex_val, den_val, lam_val in zip(z_grid, exceedance_grid, density_grid, lambda_grid):
-    print(f"  z={z_val:.6f} | exceedance={ex_val:.3e} | density={den_val:.3e} | lambda={lam_val:.6f}")

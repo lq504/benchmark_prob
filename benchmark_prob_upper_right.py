@@ -6,7 +6,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from scipy.optimize import minimize
-from scipy.sparse.linalg import LinearOperator, eigsh, eigs
+from scipy.sparse.linalg import LinearOperator, eigsh
 
 jax.config.update("jax_enable_x64", True)
 Array = jnp.ndarray
@@ -344,13 +344,14 @@ class Instanton:
         z_hat: float = 1.0,
         det_tol: float = 1e-8,
         eig_floor: float = 1e-10,
+        sigma_prior: Optional[float] = 2,
         n_eigs: Optional[int] = None,
         projectMPerp: bool = True,
     ) -> Dict[str, float]:
         m = jnp.asarray(result.log_theta, dtype=self.posterior.solver.dtype)
         dim = int(m.size)
-        C0_sqrt = jnp.eye(dim, dtype=m.dtype)
-        C0_inv_sqrt = jnp.eye(dim, dtype=m.dtype)
+        C0_sqrt = sigma_prior*jnp.eye(dim, dtype=m.dtype)
+        #C0_inv_sqrt = 1/sigma_prior*jnp.eye(dim, dtype=m.dtype)
 
         dJ = self.grad_rate(m)
         lmda_kkt = jnp.asarray(result.lam, dtype=m.dtype)
@@ -367,29 +368,30 @@ class Instanton:
             return jax.jvp(self.grad_qoi, (m,), (v,))[1]
 
         @jax.jit
-        def A_matvec(v: Array) -> Array:
+        def L_matvec(v: Array) -> Array:
             vin = _project_perp_unit(ebar, v) if projectMPerp else v
             y = C0_sqrt @ vin
             Hy = hessvec_J(y) - lmda_kkt * hessvec_q(y)
             inner = vin - (C0_sqrt @ Hy)
             ldt = _project_perp_unit(ebar, inner) if projectMPerp else inner
-            return v - ldt
+            return ldt
 
         def matvec_np(x_np: np.ndarray) -> np.ndarray:
-            y = A_matvec(jnp.asarray(x_np, dtype=m.dtype))
+            y = L_matvec(jnp.asarray(x_np, dtype=m.dtype))
             return np.asarray(jax.device_get(y), dtype=np.float64)
 
         op = LinearOperator((dim, dim), matvec=matvec_np, dtype=np.float64)
         k = int((dim - 1) if n_eigs is None else min(max(1, n_eigs), dim - 1))
         evals = eigsh(op, k=k, which="LM", tol=det_tol, return_eigenvectors=False)
         evals = np.real(evals)
-        logdet = float(np.sum(np.log(np.clip(np.abs(evals), eig_floor, None))))
+        logdet = float(np.sum(np.log(np.clip(np.abs(1.0 - evals), eig_floor, None))))
 
         base_factor = (1.0 / z_hat) * jnp.sqrt(eps / (2.0 * jnp.pi)) * jnp.exp(-J_inst / eps)
-        dJ_norm = jnp.linalg.norm(dJ) + 1e-14
-        term1 = jnp.vdot(dJ, C0_inv_sqrt @ dJ) / (dJ_norm**3)
+        #dJ_norm = jnp.linalg.norm(dJ) + 1e-14
+        #term1 = jnp.vdot(dJ, C0_inv_sqrt @ dJ) / (dJ_norm**3)
+        term1 = jnp.linalg.norm(C0_sqrt @ dJ)
         det_term = jnp.exp(-0.5 * logdet)
-        exceedance_prob = (2.0 * jnp.pi * eps) ** (dim / 2.0) * base_factor * term1 * det_term
+        exceedance_prob = (2.0 * jnp.pi * eps* sigma_prior**2) ** (dim / 2.0) * base_factor / term1 * det_term
         density_estimate = jnp.abs(lmda_kkt / eps) * exceedance_prob
 
         return {
@@ -400,6 +402,7 @@ class Instanton:
             "exceedance_prob": float(jax.device_get(exceedance_prob)),
             "density_estimate": float(jax.device_get(density_estimate)),
             "det_k": int(k),
+            "evals": evals.tolist(),
         }
 
 
@@ -409,12 +412,33 @@ def qoi_block(log_theta: Array, ix: int = 0, iy: int = 1, n_blocks: int = 8) -> 
 
 
 # %%
+def _block_pairs_to_flat_indices(pairs: List[Tuple[int, int]], n_blocks: int) -> np.ndarray:
+    indices = []
+    for ix, iy in pairs:
+        if ix < 0 or iy < 0 or ix >= n_blocks or iy >= n_blocks:
+            raise ValueError(f"block index out of range: {(ix, iy)} for n_blocks={n_blocks}")
+        indices.append(ix + iy * n_blocks)
+    if len(indices) == 0:
+        raise ValueError("selected_pairs must contain at least one (ix, iy) pair")
+    return np.asarray(indices, dtype=np.int32)
+
+
+def qoi_selected_mean(log_theta: Array, selected_indices: Array) -> Array:
+    return jnp.mean(jnp.asarray(log_theta)[jnp.asarray(selected_indices, dtype=jnp.int32)])
+
+
+# %%
 # --- demo ---
 import matplotlib.pyplot as plt
 from pathlib import Path
 
 # 1) Build solver
 solver = PDESolver(n_cells=32, n_blocks=8)
+
+# Choose the QoI locations as block-coordinate pairs (zero-based)
+#selected_pairs = [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
+selected_pairs = [(5, 5), (6, 5), (5, 6), (6, 6), (7, 5), (7, 6), (5, 7), (6, 7), (7, 7)]
+selected_indices = _block_pairs_to_flat_indices(selected_pairs, solver.n_blocks)
 
 # 2) Posterior + MAP
 posterior = PosteriorModel(solver=solver, z_hat=None, sigma_like=0.05, sigma_prior=2.0)
@@ -427,8 +451,7 @@ print("MAP message:", map_out["message"])
 print("MAP log posterior:", float(jax.device_get(map_out["log_post_map"])))
 
 # 3) Instanton object + baseline instanton
-ix, iy = 1, 1
-q_fn = lambda lt: qoi_block(lt, ix=ix, iy=iy, n_blocks=solver.n_blocks)
+q_fn = lambda lt: qoi_selected_mean(lt, selected_indices)
 instanton = Instanton(posterior=posterior, qoi_fn=q_fn)
 
 q_map = float(jax.device_get(q_fn(log_theta_map)))
@@ -503,8 +526,7 @@ print("  eps_for_Zhat      =", float(eps_for_Zhat))
 print("  logZhat_laplace   =", float(logZhat_laplace))
 print("  Z_hat_laplace     =", float(Z_hat_laplace))
 
-# 5) Sample histogram at QoI index (in log-theta coordinates)
-qoi_idx = iy * solver.n_blocks + ix
+# 5) Sample histogram at selected QoI locations in log-theta coordinates
 data_dir = Path(".")
 sample_files = sorted(data_dir.glob("samples-*.txt"))
 
@@ -519,23 +541,22 @@ for path in sample_files:
             if np.any(theta <= 0.0):
                 continue
             log_theta = np.log(theta)
-            qoi_samples.append(log_theta[qoi_idx])
+            qoi_samples.append(np.mean(log_theta[selected_indices]))
 
 qoi_samples = np.asarray(qoi_samples, dtype=np.float64)
 if qoi_samples.size == 0:
     raise RuntimeError("No valid samples parsed for QoI histogram.")
 
-q95 = float(np.percentile(qoi_samples, 95.0))
 upper = float(np.max(qoi_samples))
-if upper <= q95:
-    upper = q95 + 0.25
-z_grid = np.linspace(q95, upper, 6)
+lower = float(np.min(qoi_samples))
+z_grid = np.linspace(lower, upper, 10)
 
 print("\nQoI histogram range for density overlay")
-print("  qoi_idx       =", qoi_idx)
-print("  q95           =", q95)
+print("  selected_pairs =", selected_pairs)
+print("  selected_indices =", selected_indices.tolist())
+print("  lower           =", lower)
 print("  upper         =", upper)
-print("  n_grid        =", len(z_grid))
+print("  z_grid        =", len(z_grid))
 print("  n_samples     =", qoi_samples.size)
 
 # 6) Overlay a few instanton-based density estimates on histogram
@@ -559,7 +580,7 @@ for z_val in z_grid:
         res_z,
         eps=eps_for_Zhat,
         z_hat=float(Z_hat_laplace),
-        n_eigs=20,
+        n_eigs=None,
     )
     density_grid.append(est_z["density_estimate"])
     exceedance_grid.append(est_z["exceedance_prob"])
@@ -572,10 +593,10 @@ exceedance_grid = np.asarray(exceedance_grid, dtype=np.float64)
 lambda_grid = np.asarray(lambda_grid, dtype=np.float64)
 
 plt.figure(figsize=(8, 4.5))
-plt.hist(qoi_samples, bins=50, density=True, alpha=0.35, label=f"Sample histogram: log_theta[{qoi_idx}]")
+plt.hist(qoi_samples, bins=50, density=True, alpha=0.35, label=f"QoI histogram")
 plt.plot(z_grid, density_grid, "o-", lw=2, ms=5, label="Instanton density estimate")
-plt.axvline(q95, color="k", ls="--", lw=1.5, label="95th percentile")
-plt.xlabel(f"QoI = log_theta[{qoi_idx}] (ix={ix}, iy={iy})")
+
+plt.xlabel(f"QoI = mean(log_theta[selected_indices])")
 plt.ylabel("Density")
 plt.yscale("log")
 plt.title("Tail density overlay: sample histogram vs instanton estimates")
@@ -586,3 +607,179 @@ plt.show()
 print("\nPointwise estimates on z-grid")
 for z_val, ex_val, den_val, lam_val in zip(z_grid, exceedance_grid, density_grid, lambda_grid):
     print(f"  z={z_val:.6f} | exceedance={ex_val:.3e} | density={den_val:.3e} | lambda={lam_val:.6f}")
+
+# %%
+from matplotlib.patches import Rectangle
+
+# Use the second-last QoI target from the existing z_grid
+z0 = float(z_grid[-2])
+
+# Parse all sample fields and their QoIs in log-theta coordinates
+sample_files = sorted(Path(".").glob("samples-*.txt"))
+sample_log_thetas = []
+sample_qois = []
+
+for path in sample_files:
+    with path.open("r") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 2 + solver.theta_dim:
+                continue
+            try:
+                theta = np.asarray(parts[2:2 + solver.theta_dim], dtype=np.float64)
+            except ValueError:
+                continue
+            if theta.size != solver.theta_dim or np.any(theta <= 0.0):
+                continue
+
+            log_theta = np.log(theta)
+            qoi_val = float(np.mean(log_theta[selected_indices]))
+
+            sample_log_thetas.append(log_theta)
+            sample_qois.append(qoi_val)
+
+sample_log_thetas = np.asarray(sample_log_thetas, dtype=np.float64)
+sample_qois = np.asarray(sample_qois, dtype=np.float64)
+
+if sample_log_thetas.size == 0:
+    raise RuntimeError("No valid samples found for conditional mean plot.")
+
+# Thin band around the target QoI, widened only if needed for enough samples
+z_range = float(sample_qois.max() - sample_qois.min())
+band_halfwidth =  0.01
+min_samples = 20
+
+mask = np.abs(sample_qois - z0) <= band_halfwidth
+while mask.sum() < min_samples and band_halfwidth < 0.25 * z_range:
+    band_halfwidth *= 1.5
+    mask = np.abs(sample_qois - z0) <= band_halfwidth
+
+if mask.sum() == 0:
+    raise RuntimeError("No samples fell inside the QoI band.")
+
+conditional_mean = sample_log_thetas[mask].mean(axis=0).reshape(solver.n_blocks, solver.n_blocks)
+
+# Compute the instanton at the second-last QoI target
+inst_res_2nd_last = instanton.searchInstantonViaAugmented(
+    targetObservable=z0,
+    muMin=np.log10(1.0),
+    muMax=np.log10(1_000.0),
+    nMu=4,
+    initLbda=0.0,
+    initialM=np.asarray(jax.device_get(log_theta_map), dtype=np.float64),
+)
+
+inst_field = np.asarray(jax.device_get(inst_res_2nd_last.log_theta), dtype=np.float64).reshape(
+    solver.n_blocks, solver.n_blocks
+)
+
+# Helper to mark selected blocks on an axis
+def mark_selected_blocks(ax, selected_pairs, edgecolor="white", pointcolor="red", lw=2.0, s=50):
+    # scatter at cell centers
+    xs = [j for (i, j) in selected_pairs]
+    ys = [i for (i, j) in selected_pairs]
+    ax.scatter(xs, ys, s=s, c=pointcolor, marker="o", edgecolors="black", linewidths=0.8, zorder=3)
+
+    # draw rectangle around each selected cell
+    for i, j in selected_pairs:
+        rect = Rectangle(
+            (j - 0.5, i - 0.5), 1.0, 1.0,
+            fill=False, edgecolor=edgecolor, linewidth=lw, zorder=4
+        )
+        ax.add_patch(rect)
+
+# Plot QoI band, instanton field, and conditional mean
+fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.5), constrained_layout=True)
+
+axes[0].hist(sample_qois, bins=50, density=True, alpha=0.35, color="0.35")
+axes[0].axvspan(z0 - band_halfwidth, z0 + band_halfwidth, color="tab:orange", alpha=0.25)
+axes[0].axvline(z0, color="tab:red", lw=2)
+axes[0].set_xlabel("QoI = mean(log_theta[selected_indices])")
+axes[0].set_ylabel("Density")
+axes[0].set_title(f"Thin QoI band\nz0 = {z0:.6f}\nN = {mask.sum()}")
+
+vmin = float(min(inst_field.min(), conditional_mean.min()))
+vmax = float(max(inst_field.max(), conditional_mean.max()))
+
+im0 = axes[1].imshow(inst_field, origin="lower", cmap="viridis", vmin=vmin, vmax=vmax)
+axes[1].set_title(
+    f"Second-last instanton\nqoi = {float(jax.device_get(inst_res_2nd_last.qoi)):.6f}"
+)
+axes[1].set_xticks(range(solver.n_blocks))
+axes[1].set_yticks(range(solver.n_blocks))
+mark_selected_blocks(axes[1], selected_pairs)
+
+im1 = axes[2].imshow(conditional_mean, origin="lower", cmap="viridis", vmin=vmin, vmax=vmax)
+axes[2].set_title("Conditional mean from data\n(log_theta in QoI band)")
+axes[2].set_xticks(range(solver.n_blocks))
+axes[2].set_yticks(range(solver.n_blocks))
+mark_selected_blocks(axes[2], selected_pairs)
+
+fig.colorbar(im1, ax=axes[1:], shrink=0.9, label="log_theta")
+plt.show()
+
+# %%
+# --- Plot eigenvalues and logdet ---
+# CHOOSE Z VALUE HERE
+z_choice = z_grid[0]  # Change this to any value in z_grid or any float in the data range
+
+# Compute instanton and eigenvalues for chosen z
+res_z_choice = instanton.searchInstantonViaAugmented(
+    targetObservable=float(z_choice),
+    muMin=np.log10(1.0),
+    muMax=np.log10(1_000.0),
+    nMu=4,
+    initLbda=float(inst_res.lam),
+    initialM=np.asarray(jax.device_get(log_theta_map), dtype=np.float64),
+)
+
+est_z_final = instanton.exceedance_probability_estimate(
+    res_z_choice,
+    eps=eps_for_Zhat,
+    z_hat=float(Z_hat_laplace),
+    n_eigs=None,
+)
+evals = np.array(est_z_final.get('evals', []))
+
+if len(evals) > 0:
+    # Main plot: sorted eigenvalues
+    fig, ax = plt.subplots(figsize=(5, 5))
+    sorted_evals = np.sort(evals)
+    ax.loglog(range(1, len(sorted_evals) + 1), np.abs(sorted_evals), 'x', 
+              linewidth=1.5, markersize=7, color='darkred', label=r'$|\lambda_i|$')
+    
+    # Reference line for i^-1
+    idx_ref = np.arange(1, len(sorted_evals) + 1)
+    ax.loglog(idx_ref, 1.0 / idx_ref, 'k--', linewidth=1.5, alpha=0.6, label=r'$\propto i^{-1}$')
+    
+    ax.set_xlabel('Index $i$', fontsize=12, fontweight='bold')
+    ax.set_ylabel(r'$|\lambda_i|$', fontsize=12, fontweight='bold')
+    ax.set_title(f'Eigenvalues of $p_m A_x p_m$ for $z={z_choice:.2f}$', fontsize=13, fontweight='bold')
+    ax.legend(fontsize=11, loc='lower left')
+    #ax.grid(False, alpha=0.3, which='both')
+    
+    # Inset plot: cumulative product of (1 - lambda_i) - TOP RIGHT CORNER
+    ax_inset = ax.inset_axes([0.6, 0.65, 0.35, 0.3])
+    cum_prod = np.cumprod(np.abs(1.0 - sorted_evals))
+    ax_inset.semilogy(range(1, len(cum_prod) + 1), cum_prod, 'o', 
+                       linewidth=1, markersize=2, color='darkred')
+    ax_inset.set_xlabel('$m$', fontsize=10)
+    #ax_inset.set_ylabel(r'$\prod_{i=1}^m (1-\lambda_i)$', fontsize=10)
+    ax_inset.grid(False, alpha=0.3, which='both')
+    
+    # Print logdet info
+    logdet = est_z_final.get('logdet', None)
+    if logdet is not None:
+        print(f"\nLogdet = {logdet:.6f}")
+        print(f"Number of eigenvalues: {len(evals)}")
+        print(f"Min eigenvalue: {np.min(evals):.6f}")
+        print(f"Max eigenvalue: {np.max(evals):.6f}")
+        print(f"Mean eigenvalue: {np.mean(evals):.6f}")
+        final_prod = np.prod(np.abs(1.0 - evals))
+        print(f"Final product ∏(1-λᵢ) = {final_prod:.6e}")
+else:
+    print("No eigenvalues available to plot")
+
+plt.tight_layout()
+plt.show()
+
